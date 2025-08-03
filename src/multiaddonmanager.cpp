@@ -152,7 +152,7 @@ constexpr int g_iServerAddonsOffset = 336;
 constexpr int g_iSendNetMessageOffset = 15;
 constexpr int g_iClientListOffset = 624;
 #else
-constexpr int g_iSendNetMessageOffset = 13;
+constexpr int g_iSendNetMessageOffset = 16;
 constexpr int g_iClientListOffset = 640;
 #endif
 
@@ -1133,7 +1133,7 @@ const char *MultiAddonManager::GetLicense()
 
 const char *MultiAddonManager::GetVersion()
 {
-	return MULTIADDONMANAGER_VERSION; // defined by the build script
+	return "v1.4.4";
 }
 
 const char *MultiAddonManager::GetDate()
