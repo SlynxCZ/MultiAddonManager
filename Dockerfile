@@ -12,4 +12,4 @@ COPY ./docker-entrypoint.sh ./
 ENV HL2SDKCS2=/app/source/vendor/hl2sdk-cs2
 ENV MMSOURCE112=/app/source/vendor/metamod-source
 WORKDIR /app/source
-CMD ["/bin/bash", "./docker-entrypoint.sh"]
+CMD [ "/bin/bash", "./docker-entrypoint.sh" ]
