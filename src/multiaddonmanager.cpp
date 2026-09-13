@@ -43,6 +43,7 @@ CConVar<bool> mm_block_disconnect_messages("mm_block_disconnect_messages", FCVAR
 CConVar<bool> mm_cache_clients_with_addons("mm_cache_clients_with_addons", FCVAR_NONE, "Whether to cache clients addon download list, this will prevent reconnects on mapchange/rejoin", false);
 CConVar<float> mm_cache_clients_duration("mm_cache_clients_duration", FCVAR_NONE, "How long to cache clients' downloaded addons list in seconds, pass 0 for forever.", 0.0f);
 CConVar<float> mm_addon_connection_timeout("mm_addon_connection_timeout", FCVAR_NONE, "How long until clients are timed out while downloading the first required addon (usually the current map), 0 disables", 30.f);
+CConVar<float> mm_addon_connection_min_speed("mm_addon_connection_min_speed", FCVAR_NONE, "Slowest client download speed in KB/s to account for, extends mm_addon_connection_timeout by the time needed to download the pending addon at this speed, 0 disables", 256.f);
 CConVar<float> mm_extra_addons_timeout("mm_extra_addons_timeout", FCVAR_NONE, "How long until clients are timed out in between connects for extra addons in seconds, requires mm_extra_addons to be used", 10.f);
 
 CConVar<bool> mm_addon_debug("mm_addon_debug", FCVAR_NONE, "Whether to print some extra debug information", false);
@@ -110,6 +111,23 @@ ISteamUGC *GetSteamUGC()
 		return SteamGameServerUGC();
 	else
 		return SteamUGC();
+}
+
+// How long it takes to download an addon at mm_addon_connection_min_speed, based on the size of the server's copy.
+// Returns 0 if the size is unknown, e.g. for client-only addons which are not installed on the server.
+float GetAddonDownloadTime(const std::string &addon)
+{
+	ISteamUGC *pUGC = GetSteamUGC();
+	if (mm_addon_connection_min_speed.Get() <= 0 || addon.empty() || !pUGC)
+		return 0.f;
+
+	uint64 iSizeOnDisk = 0;
+	uint32 iTimeStamp = 0;
+	char szFolder[MAX_PATH];
+	if (!pUGC->GetItemInstallInfo(V_StringToUint64(addon.c_str(), 0), &iSizeOnDisk, szFolder, sizeof(szFolder), &iTimeStamp))
+		return 0.f;
+
+	return iSizeOnDisk / 1024.0 / mm_addon_connection_min_speed.Get();
 }
 
 typedef bool (FASTCALL *SendNetMessage_t)(CServerSideClientBase *, const CNetMessage*, NetChannelBufType_t);
@@ -1223,23 +1241,32 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 		return {KHook::Action::Ignore};
 	}
 
+	// Handle the first addon here. The rest should be handled in the SendNetMessage hook.
+	if (clientInfo.downloadedAddons.Find(clientAddons[0]) == -1)
+		clientInfo.currentPendingAddon = clientAddons[0];
+
 	if (clientInfo.connectedState != CLIENTCONN_CONNECTING)
 	{
 		clientInfo.connectionStartTime = Plat_FloatTime();
 		clientInfo.connectedState = CLIENTCONN_CONNECTING;
 	}
-	else if (mm_addon_connection_timeout.Get() > 0 &&
-		clientInfo.connectedState == CLIENTCONN_CONNECTING && 
-		Plat_FloatTime() - clientInfo.connectionStartTime > mm_addon_connection_timeout.Get())
+	else if (mm_addon_connection_timeout.Get() > 0)
 	{
-		// Can't kick right now as this will crash on windows, so defer to the next frame
-		AddTimedOutClient(steamID64);
-		return {KHook::Action::Supersede};
-	}
+		// ReplyConnection keeps getting called both while the client is on the download popup and while it's downloading,
+		// we can't tell these apart so give slow clients enough time to download the pending addon on top of the base timeout
+		float flTimeout = mm_addon_connection_timeout.Get() + GetAddonDownloadTime(clientInfo.currentPendingAddon);
 
-	// Handle the first addon here. The rest should be handled in the SendNetMessage hook.
-	if (clientInfo.downloadedAddons.Find(clientAddons[0]) == -1)
-		clientInfo.currentPendingAddon = clientAddons[0];
+		if (Plat_FloatTime() - clientInfo.connectionStartTime > flTimeout)
+		{
+			if (mm_addon_debug.Get())
+				Message("%s: Client %lli did not download addon %s within %.1f seconds, timing out\n",
+					__func__, steamID64, clientInfo.currentPendingAddon.c_str(), flTimeout);
+
+			// Can't kick right now as this will crash on windows, so defer to the next frame
+			AddTimedOutClient(steamID64);
+			return {KHook::Action::Supersede};
+		}
+	}
 
 	// In some cases, clients can do a signature check on addons which fails and instantly disconnects them
 	// As a mitigation, remove all undownloaded addons so the client never does the failing signature check

@@ -10,6 +10,7 @@ A MetaMod plugin that allows you to use multiple workshop addons at once and hav
 
 - `mm_extra_addons_timeout <seconds> (default 10)` How long until clients are timed out in between connects for extra addons, timed out clients will reconnect for their current pending download.
 - `mm_addon_connection_timeout <seconds> (default 30)` // How long until clients are timed out while downloading the first required addon (usually the current map), 0 disables
+- `mm_addon_connection_min_speed <0/KB/s> (default 256)` Slowest client download speed to account for. `mm_addon_connection_timeout` is extended by the time needed to download the pending addon at this speed, so clients on slow connections aren't kicked mid-download. Only applies to addons installed on the server, pass 0 to disable.
 - `mm_print_searchpaths` Print all the search paths currently mounted by the server.
 - `mm_addon_mount_download <0/1> (default 0)` If enabled, the plugin will initiate an addon download every time even if it's already installed, this will guarantee that updates are applied immediately.
 - `mm_cache_clients_with_addons <0/1> (default 0)` If enabled, the plugin will keep track of which addons client SteamIDs have downloaded to prevent sending them addons when they already have them (i.e. when they rejoin or the map changes).
