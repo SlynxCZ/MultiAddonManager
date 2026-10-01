@@ -45,6 +45,7 @@ CConVar<float> mm_cache_clients_duration("mm_cache_clients_duration", FCVAR_NONE
 CConVar<float> mm_addon_connection_timeout("mm_addon_connection_timeout", FCVAR_NONE, "How long until clients are timed out while downloading the first required addon (usually the current map), 0 disables", 30.f);
 CConVar<float> mm_addon_connection_min_speed("mm_addon_connection_min_speed", FCVAR_NONE, "Slowest client download speed in KB/s to account for, extends mm_addon_connection_timeout by the time needed to download the pending addon at this speed, 0 disables", 256.f);
 CConVar<float> mm_extra_addons_timeout("mm_extra_addons_timeout", FCVAR_NONE, "How long until clients are timed out in between connects for extra addons in seconds, requires mm_extra_addons to be used", 10.f);
+CConVar<float> mm_failed_addons_skip_duration("mm_failed_addons_skip_duration", FCVAR_NONE, "How long to stop sending addons to a client that failed to download them (e.g. GeForce NOW cannot download workshop items) in seconds, -1 for forever, 0 disables", 21600.f);
 
 CConVar<bool> mm_addon_debug("mm_addon_debug", FCVAR_NONE, "Whether to print some extra debug information", false);
 
@@ -163,7 +164,7 @@ constexpr int g_iSendNetMessageOffset = 15;
 constexpr int g_iSendNetMessageOffset = 16;
 #endif
 
-/* 
+/*
 The general workflow is defined as follows:
 0. The server defines a list of server side addons and global client side addons to mount.
 1. Client connects and request for the list of addons through ReplyConnection. MAM get the full list of addons to load.
@@ -197,9 +198,31 @@ struct ClientAddonInfo_t
 	std::string currentPendingAddon;
 	ClientConnectedState_t connectedState = CLIENTCONN_NONE;
 	double connectionStartTime {};
+	// Addons sent in the last S2C_CONNECTION, and whether the client went active since then.
+	CUtlVector<std::string> lastSentAddons;
+	bool bActiveSinceLastReply = false;
+	// Addons the client failed to download, mapped to the time of the failure.
+	std::unordered_map<std::string, double> failedAddons;
 };
 
 std::unordered_map<uint64, ClientAddonInfo_t> g_ClientAddons;
+
+// Whether the client failed to download this addon recently enough that it should not be sent to them, expired entries are dropped.
+static bool IsFailedClientAddon(ClientAddonInfo_t &clientInfo, const std::string &addon)
+{
+	auto it = clientInfo.failedAddons.find(addon);
+	if (it == clientInfo.failedAddons.end())
+		return false;
+
+	float flDuration = mm_failed_addons_skip_duration.Get();
+	if (flDuration == 0 || (flDuration > 0 && Plat_FloatTime() - it->second > flDuration))
+	{
+		clientInfo.failedAddons.erase(it);
+		return false;
+	}
+
+	return true;
+}
 
 CUtlVector<CServerSideClient *> *GetClientList()
 {
@@ -882,6 +905,13 @@ void MultiAddonManager::GetClientAddons(CUtlVector<std::string> &addons, uint64 
 			if (addons.Find(g_ClientAddons[steamID64].addonsToLoad[i].c_str()) == -1)
 				addons.AddToTail(g_ClientAddons[steamID64].addonsToLoad[i].c_str());
 		}
+
+		// Drop addons this client could not download, the workshop map is required so it always stays.
+		FOR_EACH_VEC_BACK(addons, i)
+		{
+			if (addons[i] != GetCurrentWorkshopMap() && IsFailedClientAddon(g_ClientAddons[steamID64], addons[i]))
+				addons.Remove(i);
+		}
 	}
 }
 
@@ -991,6 +1021,20 @@ bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pDat
 		// This puts the client in limbo because client doesn't know how to handle multiple addons at the same time.
 		CUtlVector<std::string> addonsList;
 		StringToVector(pMsg->addons().c_str(), addonsList);
+
+		// Don't make the client reload into addons it already failed to download, it would just drop itself to idle again.
+		bool bRemovedFailed = false;
+		FOR_EACH_VEC_BACK(addonsList, i)
+		{
+			if (addonsList[i] != g_MultiAddonManager.GetCurrentWorkshopMap() && IsFailedClientAddon(clientInfo, addonsList[i]))
+			{
+				addonsList.Remove(i);
+				bRemovedFailed = true;
+			}
+		}
+		if (bRemovedFailed)
+			pMsg->set_addons(VectorToString(addonsList).c_str());
+
 		if (addonsList.Count() > 1)
 		{
 			// If there's more than one addon, ensure that it takes the first addon (which should be the workshop map or the first custom addon)
@@ -1145,9 +1189,28 @@ KHook::Return<bool> MultiAddonManager::Hook_CanHLTVClientConnect(IServerGameClie
 
 KHook::Return<void> MultiAddonManager::Hook_ClientDisconnect(IServerGameClients *pThis, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
 {
+	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
+
+	// The client drops itself to idle when its Steam UGC refuses or fails the workshop download (CDownloadWorkshopAddonPrerequisite),
+	// e.g. on GeForce NOW. Nothing server-side can make it accept the addon, so stop sending it the addons it was given.
+	if (reason == NETWORK_DISCONNECT_REQUEST_HOSTSTATE_IDLE && !clientInfo.bActiveSinceLastReply && mm_failed_addons_skip_duration.Get() != 0)
+	{
+		FOR_EACH_VEC(clientInfo.lastSentAddons, i)
+		{
+			const std::string &addon = clientInfo.lastSentAddons[i];
+			if (addon == GetCurrentWorkshopMap())
+				continue;
+
+			clientInfo.failedAddons[addon] = Plat_FloatTime();
+			clientInfo.downloadedAddons.FindAndRemove(addon);
+			Message("%s: Client %lli dropped to idle while loading addon %s, it will not be sent to them again\n", __func__, steamID64, addon.c_str());
+		}
+	}
+	clientInfo.lastSentAddons.RemoveAll();
+
 	// Mark the disconnection time for caching purposes.
-	g_ClientAddons[steamID64].lastActiveTime = Plat_FloatTime();
-	g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
+	clientInfo.lastActiveTime = Plat_FloatTime();
+	clientInfo.connectedState = CLIENTCONN_NONE;
 
 	return {KHook::Action::Ignore};
 }
@@ -1157,6 +1220,8 @@ KHook::Return<void> MultiAddonManager::Hook_ClientActive(IServerGameClients *pTh
 	// When the client reaches this stage, they should already have all the necessary addons downloaded, so we can safely remove the downloaded addons list here.
 	if (!mm_cache_clients_with_addons.Get())
 		g_ClientAddons[steamID64].downloadedAddons.RemoveAll();
+
+	g_ClientAddons[steamID64].bActiveSinceLastReply = true;
 
 	return {KHook::Action::Ignore};
 }
@@ -1235,10 +1300,18 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 	GetClientAddons(clientAddons, steamID64);
 	if (clientAddons.Count() == 0)
 	{
-		// No addons to send. This means the list of original addons is empty as well.
-		assert(originalAddons.IsEmpty());
 		clientInfo.currentPendingAddon.clear();
-		return {KHook::Action::Ignore};
+		clientInfo.lastSentAddons.RemoveAll();
+
+		// No addons to send. The original list is only non-empty when every addon was skipped as failed for this client.
+		if (originalAddons.IsEmpty())
+			return {KHook::Action::Ignore};
+
+		*addons = "";
+		m_hookReplyConnection.CallOriginal(pThis, pClient);
+		*addons = originalAddons;
+
+		return {KHook::Action::Supersede};
 	}
 
 	// Handle the first addon here. The rest should be handled in the SendNetMessage hook.
@@ -1279,6 +1352,8 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 	}
 	
 	*addons = VectorToString(clientAddons).c_str();
+	clientInfo.lastSentAddons = clientAddons;
+	clientInfo.bActiveSinceLastReply = false;
 
 	if (mm_addon_debug.Get())
 		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, addons->Get(), steamID64);
